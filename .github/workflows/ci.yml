@@ -1,40 +1,30 @@
+# Fork only, never part of the PR: the api-tests and lint jobs, plus prettier on the
+# touched files, without the image jobs (they push to ghcr on workflow_dispatch).
 name: CI
 
 on:
-  pull_request:
-    branches: [master]
+  push:
+    branches: [ruby-base-text-test-only, ruby-base-text-verify]
   workflow_dispatch:
 
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-# Same-repo PRs and workflow_dispatch can push the tested image to ghcr so
-# docker.yml can retag it. Fork PRs cannot; they load the image locally.
-env:
-  CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-
 jobs:
-  deployment-script-tests:
+  api-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Validate gated deployment and rollback
-        run: bash deploy/cloud/deploy-cloud.test.sh
-      - name: Validate image retag helper
-        run: |
-          bash -n scripts/ci/fetch-dicts.sh
-          bash -n scripts/ci/retag-tree-image.sh
-          bash scripts/ci/retag-tree-image.test.sh
-
-  # Anki addon (#241): aqt-free contract tests over anki-addon/lector — chunk
-  # ceilings vs the API's batch caps, review-payload shape, ownership scoping.
-  addon-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Anki addon contract tests
-        run: python3 -m unittest discover -s anki-addon/tests -v
+      - uses: oven-sh/setup-bun@v2
+      - name: Install eSpeak NG
+        run: sudo apt-get update && sudo apt-get install -y espeak-ng
+      - run: bun install --frozen-lockfile
+        working-directory: api
+      - name: Typecheck API
+        run: bun run typecheck
+        working-directory: api
+      - name: Ruby test alone
+        run: bun test src/lib/epub-parser.test.ts
+        working-directory: api
+      - run: bun run test
+        working-directory: api
 
   lint:
     runs-on: ubuntu-latest
@@ -46,248 +36,4 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-
-  typecheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npx tsc --noEmit
-
-  unit-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      # dictionary-db.test.ts is an integration test over the real (gitignored)
-      # dictionaries — without this the whole vitest run fails in beforeAll.
-      - uses: ./.github/actions/fetch-dicts
-      - run: npm test
-      - name: Verify starter content
-        # Packs that ship a starter series (#317) must stay verifier-clean:
-        # band discipline, every token dictionary-resolvable, and ≥90% of the
-        # top-1,000 introduced. Skips languages without a starter manifest.
-        run: |
-          set -a; . ./dict.env; set +a
-          for L in $DICT_LANGS; do
-            if [ -f "languages/$L/content/starter/manifest.json" ]; then
-              npx tsx scripts/verify-starter-content.ts --lang "$L" --require-coverage 90
-            fi
-          done
-
-  api-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: oven-sh/setup-bun@v2
-      # eSpeak NG backs the espeak TTS engine branch (#307 §3.2c); the tts
-      # route tests synthesize through the real binary (they skip when it is
-      # absent, so installing here keeps them exercised in CI).
-      - name: Install eSpeak NG
-        run: sudo apt-get update && sudo apt-get install -y espeak-ng
-      - run: bun install --frozen-lockfile
-        working-directory: api
-      - name: Typecheck API
-        run: bun run typecheck
-        working-directory: api
-      # bun run test, not bare bun test — the script isolates DATA_DIR
-      - run: bun run test
-        working-directory: api
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-
-  e2e-tests:
-    runs-on: ubuntu-latest
-    needs: [build]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - uses: oven-sh/setup-bun@v2
-      # eSpeak NG backs the espeak TTS engine (#307 §3.2c) — the Esperanto e2e
-      # spec asserts real WAV synthesis through the dev API server.
-      - name: Install eSpeak NG
-        run: sudo apt-get update && sudo apt-get install -y espeak-ng
-      - run: npm ci
-      - run: cd api && bun install --frozen-lockfile
-      # The dictionaries are gitignored — they ship in the Docker image. For CI
-      # the dev server needs a copy at data/dictionary-<lang>.db so e2e tests
-      # that assert the "on-device" lookup path actually find a hit.
-      - uses: ./.github/actions/fetch-dicts
-      - uses: ./.github/actions/setup-playwright
-      - run: npm run test:e2e
-      - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() }}
-        with:
-          name: playwright-report
-          path: playwright-report/
-          retention-days: 7
-
-  # The dev-mode e2e job above exercises `next dev` + Bun from source. This one
-  # runs the same suite against the production artifact — the standalone Next
-  # build + docker-entrypoint.sh (both servers in one container) — so standalone
-  # packaging and the browser→Hono direct calls are covered before a release
-  # image is ever cut (#110, #188).
-  #
-  # The image is pushed as ghcr.io/heuwels/lector:tree-<tree>-amd64. docker.yml
-  # retags that image on merge; it does not build amd64 again. Fork PRs cannot
-  # push, so they load the image into the runner instead.
-  e2e-docker:
-    runs-on: ubuntu-latest
-    needs: [build]
-    permissions:
-      contents: read
-      packages: write
-      actions: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          # Full history + tags so `git describe` can stamp APP_VERSION.
-          fetch-depth: 0
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - name: Build production image
-        uses: ./.github/actions/build-image
-        with:
-          platform: linux/amd64
-          push: ${{ env.CAN_PUSH }}
-          load: ${{ env.CAN_PUSH != 'true' }}
-          local_tag: lector:e2e
-          pr_number: ${{ github.event.pull_request.number }}
-          git_commit: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Cloud mode without a secret refuses to boot (fail-closed guard, #242/#218)
-        # LECTOR_MODE=cloud runs built-in accounts (#218) and must exit
-        # non-zero without BETTER_AUTH_SECRET — never sign sessions with the
-        # library's default secret. Also pins the message so the guard can't
-        # silently rot.
-        run: |
-          set +e
-          OUT=$(docker run --rm -e LECTOR_MODE=cloud lector:e2e 2>&1)
-          CODE=$?
-          set -e
-          echo "$OUT"
-          if [ "$CODE" -eq 0 ]; then
-            echo "Expected non-zero exit for LECTOR_MODE=cloud without BETTER_AUTH_SECRET, got success" >&2
-            exit 1
-          fi
-          echo "$OUT" | grep -q "LECTOR_MODE=cloud requires BETTER_AUTH_SECRET"
-
-      - name: Cloud proper boots with a secret and requires auth (#218)
-        # The other half of the guard: cloud + BETTER_AUTH_SECRET must boot,
-        # report its mode via /health, mount the Better Auth endpoints, and
-        # 401 unauthenticated API requests (the session middleware, not the
-        # selfhost passthrough).
-        run: |
-          docker run -d --name lector-cloud -p 3459:3457 \
-            -e LECTOR_MODE=cloud -e BETTER_AUTH_SECRET=ci-boot-check-secret lector:e2e
-          for i in $(seq 1 30); do
-            BODY=$(curl -fsS http://localhost:3459/health 2>/dev/null) && break
-            sleep 2
-          done
-          echo "health: $BODY"
-          VOCAB_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:3459/api/vocab?language=af")
-          AUTH_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://localhost:3459/api/auth/sign-in/email" \
-            -H 'Content-Type: application/json' -d '{"email":"nobody@example.com","password":"wrong"}')
-          echo "unauthenticated /api/vocab: $VOCAB_CODE (want 401), /api/auth sign-in: $AUTH_CODE (want 401 from the engine, not 404)"
-          docker rm -f lector-cloud
-          echo "$BODY" | grep -q '"mode":"cloud"'
-          [ "$VOCAB_CODE" = "401" ] && [ "$AUTH_CODE" = "401" ]
-
-      - name: Cloud canary shape boots (external gate, #242)
-        # cloud + LECTOR_CLOUD_GATE=external is the deploy/cloud/ canary shape
-        # (an authenticating gateway fronts the app). It must boot and report
-        # its mode via /health so the deployed canary can be smoke-checked.
-        run: |
-          docker run -d --name lector-canary -p 3458:3457 \
-            -e LECTOR_MODE=cloud -e LECTOR_CLOUD_GATE=external lector:e2e
-          for i in $(seq 1 30); do
-            BODY=$(curl -fsS http://localhost:3458/health 2>/dev/null) && break
-            sleep 2
-          done
-          echo "health: $BODY"
-          docker rm -f lector-canary
-          echo "$BODY" | grep -q '"mode":"cloud"'
-
-      # The published image ships no dictionaries (#438). The specs that assert
-      # the on-device lookup path need them, so seed DICT_DIR from the cached
-      # download instead. That also keeps this job off GitHub's release
-      # endpoint: DICT_FETCH=0 below turns the runtime fetch off, so a release
-      # outage can never flake the e2e suite.
-      - uses: ./.github/actions/fetch-dicts
-      - name: Start container
-        # /app/data has no volume mount: it starts empty, matching the fresh DB
-        # the dev-mode webServer guarantees. /app/dict is mounted read-only from
-        # the seeded dictionaries above. Container :3000 maps to host :3456 (the
-        # UI origin the specs hardcode); :3457 maps to host :3457 (the Hono API —
-        # the browser client and the specs' page.request calls hit it directly
-        # now that the Next /api proxy is gone, #188). host-gateway lets the
-        # in-container Bun API reach test stubs on the runner (lmstudio-chat.spec.ts).
-        run: |
-          docker run -d --name lector-e2e -p 3456:3000 -p 3457:3457 \
-            -e DICT_FETCH=0 \
-            -v "$PWD/data:/app/dict:ro" \
-            --add-host=host.docker.internal:host-gateway lector:e2e
-      - run: npm ci
-      - uses: ./.github/actions/setup-playwright
-      - name: Wait for app
-        run: |
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:3456 > /dev/null; then exit 0; fi
-            sleep 2
-          done
-          echo "App did not become ready in 60s" >&2
-          docker logs lector-e2e
-          exit 1
-      - name: Run e2e suite against the image
-        run: E2E_EXTERNAL_SERVER=1 npm run test:e2e
-      - name: Dump container logs
-        if: failure()
-        run: docker logs lector-e2e
-      - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() }}
-        with:
-          name: playwright-report-docker
-          path: playwright-report/
-          retention-days: 7
-
-  # Production hosts are arm64. Build that image on the PR so docker.yml can
-  # retag it instead of compiling Next again on merge.
-  docker-arm64:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-24.04-arm
-    needs: [build]
-    permissions:
-      contents: read
-      packages: write
-      actions: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/build-image
-        with:
-          platform: linux/arm64
-          push: true
-          pr_number: ${{ github.event.pull_request.number }}
-          git_commit: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: npx prettier --check api/src/lib/html-to-markdown.ts api/src/lib/epub-parser.test.ts
